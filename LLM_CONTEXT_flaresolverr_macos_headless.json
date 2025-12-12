@@ -1,0 +1,130 @@
+{
+  "project": "FlareSolverr",
+  "platform": {
+    "os": "macOS",
+    "arch": "arm64 (Apple Silicon)",
+    "init_system": "launchd (user agent)",
+    "python": "venv-based, Python 3.12+"
+  },
+  "problem_statement": {
+    "symptoms": [
+      "Chrome windows flashing despite HEADLESS=true",
+      "Chrome appearing briefly in Dock",
+      "Xvfb dependency causing failures on macOS",
+      "Slow startup due to spawning Chrome just to detect version/UA"
+    ],
+    "constraints": [
+      "Must run via launchd",
+      "Must be headless",
+      "No GUI artifacts",
+      "Minimal divergence from upstream"
+    ]
+  },
+  "final_solution": {
+    "summary": [
+      "Native Chrome headless mode on macOS (no Xvfb)",
+      "Avoid spawning Chrome during startup for version detection",
+      "Persist UA cache keyed by Chrome major version",
+      "macOS-specific fast paths guarded by sys.platform == 'darwin'"
+    ],
+    "status": "working and verified"
+  },
+  "code_changes": {
+    "files_modified": [
+      "src/utils.py"
+    ],
+    "key_changes": [
+      {
+        "area": "Chrome version detection",
+        "description": "Read Chrome version from macOS app bundle Info.plist instead of running `chrome --version`",
+        "function": "_get_macos_chrome_app_version"
+      },
+      {
+        "area": "Chrome executable detection",
+        "description": "Prefer /Applications/Google Chrome.app and Chromium.app on macOS",
+        "function": "get_chrome_exe_path"
+      },
+      {
+        "area": "Headless handling",
+        "description": "macOS uses native Chrome headless; Xvfb only attempted on Linux",
+        "function": "get_webdriver"
+      },
+      {
+        "area": "User-Agent optimization",
+        "description": "Persist UA to disk and reuse if Chrome major version matches",
+        "functions": [
+          "_load_user_agent_cache",
+          "_save_user_agent_cache",
+          "get_user_agent"
+        ]
+      },
+      {
+        "area": "Bug fix",
+        "description": "Fix invalid regex escape warning",
+        "function": "extract_version_nt_folder",
+        "change": "Use raw string r'\\d+\\.\\d+\\.\\d+\\.\\d+'"
+      }
+    ],
+    "non_changes": [
+      "No changes required to flaresolverr_service.py",
+      "No env-based DRIVER switching logic required"
+    ]
+  },
+  "launchd_configuration": {
+    "program": ".venv/bin/python src/flaresolverr.py",
+    "environment_variables": {
+      "HOST": "127.0.0.1",
+      "PORT": "8191",
+      "HEADLESS": "true",
+      "PYTHONWARNINGS": "ignore:resource_tracker:UserWarning",
+      "PATH": "/opt/homebrew/bin:/opt/homebrew/sbin:/usr/bin:/bin:/usr/sbin:/sbin"
+    },
+    "notes": [
+      "DRIVER=uc is ignored on official master; safe to remove",
+      "DISPLAY may exist in inherited env but is not used",
+      "resource_tracker warnings are harmless shutdown noise"
+    ]
+  },
+  "verification_commands": {
+    "browser_test": [
+      "PYTHONPATH=src python -c \"import logging; logging.basicConfig(level=logging.INFO); import flaresolverr_service as s; s.test_browser_installation()\""
+    ],
+    "service_check": [
+      "curl http://127.0.0.1:8191/",
+      "curl -X POST http://127.0.0.1:8191/v1 -H 'Content-Type: application/json' -d '{\"cmd\":\"sessions.list\"}'"
+    ],
+    "launchd_inspection": [
+      "launchctl print gui/$(id -u)/org.flaresolverr | sed -n '/environment = {/,/}/p'"
+    ]
+  },
+  "git_workflow": {
+    "branch": "john/macos-headless-fixes",
+    "rationale": "Isolate macOS-specific optimizations; keep master clean",
+    "commands": [
+      "git switch -c john/macos-headless-fixes",
+      "git add src/utils.py",
+      "git commit -m \"macOS: headless Chrome optimizations; avoid Xvfb; plist version fast path\"",
+      "git push -u origin john/macos-headless-fixes"
+    ],
+    "update_strategy": [
+      "git fetch upstream",
+      "git rebase upstream/master",
+      "git push --force-with-lease"
+    ]
+  },
+  "design_principles": [
+    "Prefer platform-specific fast paths over environment variables",
+    "Avoid deleting cross-platform code unless provably unreachable",
+    "Optimize for launchd stability and zero GUI artifacts",
+    "Keep diffs small to reduce rebase friction"
+  ],
+  "known_good_state": {
+    "date": "2025-12-12",
+    "observed_behavior": [
+      "No Chrome UI windows",
+      "No Dock icon",
+      "Fast startup",
+      "FlareSolverr responds correctly to requests"
+    ]
+  }
+}
