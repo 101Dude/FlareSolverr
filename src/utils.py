@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import platform
+import plistlib
 import re
 import shutil
 import sys
@@ -271,6 +272,37 @@ def get_webdriver(proxy: dict = None) -> WebDriver:
     return driver
 
 
+def _get_macos_chrome_app_version() -> str:
+    """Return Chrome/Chromium version string from the app bundle Info.plist on macOS.
+
+    Avoids launching the browser process just to obtain `--version` output.
+    Returns an empty string if not found.
+    """
+    if sys.platform != 'darwin':
+        return ''
+
+    # Prefer Google Chrome, then Chromium if present.
+    candidates = [
+        '/Applications/Google Chrome.app/Contents/Info.plist',
+        '/Applications/Chromium.app/Contents/Info.plist',
+    ]
+    for plist_path in candidates:
+        try:
+            if not os.path.isfile(plist_path):
+                continue
+            with open(plist_path, 'rb') as f:
+                info = plistlib.load(f)
+            # Typical keys on macOS app bundles.
+            version = (info.get('CFBundleShortVersionString')
+                       or info.get('KSVersion')
+                       or info.get('CFBundleVersion')
+                       or '')
+            return str(version).strip()
+        except Exception:
+            continue
+    return ''
+
+
 def get_chrome_exe_path() -> str:
     global CHROME_EXE_PATH
     if CHROME_EXE_PATH is not None:
@@ -288,6 +320,16 @@ def get_chrome_exe_path() -> str:
     if os.path.exists(chrome_path):
         CHROME_EXE_PATH = chrome_path
         return CHROME_EXE_PATH
+    # macOS fast path: prefer the standard app bundle locations.
+    if sys.platform == 'darwin':
+        mac_candidates = [
+            '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+            '/Applications/Chromium.app/Contents/MacOS/Chromium',
+        ]
+        for p in mac_candidates:
+            if os.path.isfile(p) and os.access(p, os.X_OK):
+                CHROME_EXE_PATH = p
+                return CHROME_EXE_PATH
     # system
     CHROME_EXE_PATH = uc.find_chrome_executable()
     return CHROME_EXE_PATH
@@ -309,16 +351,28 @@ def get_chrome_major_version() -> str:
                 # Example: '104.0.5112.79'
                 complete_version = extract_version_nt_folder()
     else:
-        chrome_path = get_chrome_exe_path()
-        # Example 1: 'Chromium 104.0.5112.79 ...'
-        # Example 2: 'Google Chrome 104.0.5112.79 ...'
-        try:
-            cp = subprocess.run([chrome_path, '--version'], capture_output=True, text=True, timeout=3)
-            complete_version = (cp.stdout or cp.stderr or '').strip()
-        except Exception:
+        # macOS fast path: read the version from the Chrome app bundle plist to avoid
+        # spawning the Chrome process during startup.
+        if sys.platform == 'darwin':
+            complete_version = _get_macos_chrome_app_version()
+        else:
             complete_version = ''
 
-    CHROME_MAJOR_VERSION = complete_version.split('.')[0].split(' ')[-1]
+        # Fallback: ask the binary for its version (Linux, and macOS if plist parsing failed)
+        if not complete_version:
+            chrome_path = get_chrome_exe_path()
+            # Example 1: 'Chromium 104.0.5112.79 ...'
+            # Example 2: 'Google Chrome 104.0.5112.79 ...'
+            try:
+                cp = subprocess.run([chrome_path, '--version'], capture_output=True, text=True, timeout=3)
+                complete_version = (cp.stdout or cp.stderr or '').strip()
+            except Exception:
+                complete_version = ''
+
+    # Normalize and extract major version.
+    # Inputs can be either "143.0.0.0" (plist) or "Google Chrome 143.0.0.0" (binary output).
+    version_token = complete_version.strip().split(' ')[-1] if complete_version else ''
+    CHROME_MAJOR_VERSION = version_token.split('.')[0] if version_token else ''
     return CHROME_MAJOR_VERSION
 
 
