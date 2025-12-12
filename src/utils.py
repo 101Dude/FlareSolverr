@@ -5,6 +5,7 @@ import platform
 import re
 import shutil
 import sys
+import subprocess
 import tempfile
 import urllib.parse
 
@@ -18,6 +19,44 @@ CHROME_MAJOR_VERSION = None
 USER_AGENT = None
 XVFB_DISPLAY = None
 PATCHED_DRIVER_PATH = None
+
+
+# Persisted UA cache to avoid launching Chrome just to compute navigator.userAgent.
+# This is especially helpful on macOS where headless/GUI startup is comparatively expensive.
+UA_CACHE_DIR = os.path.join(os.path.expanduser('~'), 'Library', 'Caches', 'flaresolverr') if sys.platform == 'darwin' else None
+UA_CACHE_FILE = os.path.join(UA_CACHE_DIR, 'user_agent.json') if UA_CACHE_DIR else None
+
+
+def _load_user_agent_cache(expected_chrome_major: str | None) -> str | None:
+    if not UA_CACHE_FILE:
+        return None
+    try:
+        if not os.path.isfile(UA_CACHE_FILE):
+            return None
+        with open(UA_CACHE_FILE, 'r') as f:
+            data = json.load(f)
+        ua = data.get('userAgent')
+        major = data.get('chromeMajor')
+        if not ua or not major:
+            return None
+        # Only reuse if the stored UA matches the currently detected Chrome major version.
+        if expected_chrome_major and str(major) != str(expected_chrome_major):
+            return None
+        return str(ua)
+    except Exception:
+        return None
+
+
+def _save_user_agent_cache(user_agent: str, chrome_major: str | None) -> None:
+    if not UA_CACHE_FILE or not user_agent:
+        return
+    try:
+        os.makedirs(UA_CACHE_DIR, exist_ok=True)
+        with open(UA_CACHE_FILE, 'w') as f:
+            json.dump({'userAgent': user_agent, 'chromeMajor': chrome_major}, f)
+    except Exception:
+        # Cache failures should never break startup.
+        pass
 
 
 def get_config_log_html() -> bool:
@@ -43,6 +82,7 @@ def get_flaresolverr_version() -> str:
     with open(package_path) as f:
         FLARESOLVERR_VERSION = json.loads(f.read())['version']
         return FLARESOLVERR_VERSION
+
 
 def get_current_platform() -> str:
     global PLATFORM_VERSION
@@ -135,14 +175,18 @@ def get_webdriver(proxy: dict = None) -> WebDriver:
 
     # undetected_chromedriver
     options = uc.ChromeOptions()
-    options.add_argument('--no-sandbox')
     options.add_argument('--window-size=1920,1080')
     options.add_argument('--disable-search-engine-choice-screen')
-    # todo: this param shows a warning in chrome head-full
-    options.add_argument('--disable-setuid-sandbox')
-    options.add_argument('--disable-dev-shm-usage')
-    # this option removes the zygote sandbox (it seems that the resolution is a bit faster)
-    options.add_argument('--no-zygote')
+
+    # Linux/container-oriented flags: keep them on Linux, avoid them on macOS/Windows.
+    if sys.platform.startswith('linux'):
+        options.add_argument('--no-sandbox')
+        # todo: this param shows a warning in chrome head-full
+        options.add_argument('--disable-setuid-sandbox')
+        options.add_argument('--disable-dev-shm-usage')
+        # this option removes the zygote sandbox (it seems that the resolution is a bit faster)
+        options.add_argument('--no-zygote')
+
     # attempt to fix Docker ARM32 build
     IS_ARMARCH = platform.machine().startswith(('arm', 'aarch'))
     if IS_ARMARCH:
@@ -168,14 +212,22 @@ def get_webdriver(proxy: dict = None) -> WebDriver:
         logging.debug("Using webdriver proxy: %s", proxy_url)
         options.add_argument('--proxy-server=%s' % proxy_url)
 
-    # note: headless mode is detected (headless = True)
-    # we launch the browser in head-full mode with the window hidden
+    # Headless handling
+    # - Windows: use uc's native headless mode (no Xvfb)
+    # - macOS: use native headless mode (no Xvfb)
+    # - Linux: if headless, prefer Xvfb (when available)
     windows_headless = False
     if get_config_headless():
-        if os.name == 'nt':
+        if os.name == 'nt' or sys.platform == 'darwin':
             windows_headless = True
         else:
-            start_xvfb_display()
+            # On Linux, FlareSolverr historically used Xvfb for headless.
+            # If Xvfb is not available, fall back to native Chrome headless.
+            try:
+                start_xvfb_display()
+            except OSError as e:
+                logging.warning("Xvfb not available (%s); falling back to native headless.", e)
+                windows_headless = True
     # For normal headless mode:
     # options.add_argument('--headless')
 
@@ -213,14 +265,6 @@ def get_webdriver(proxy: dict = None) -> WebDriver:
     # clean up proxy extension directory
     if proxy_extension_dir is not None:
         shutil.rmtree(proxy_extension_dir)
-
-    # selenium vanilla
-    # options = webdriver.ChromeOptions()
-    # options.add_argument('--no-sandbox')
-    # options.add_argument('--window-size=1920,1080')
-    # options.add_argument('--disable-setuid-sandbox')
-    # options.add_argument('--disable-dev-shm-usage')
-    # driver = webdriver.Chrome(options=options)
 
     return driver
 
@@ -264,11 +308,13 @@ def get_chrome_major_version() -> str:
                 complete_version = extract_version_nt_folder()
     else:
         chrome_path = get_chrome_exe_path()
-        process = os.popen(f'"{chrome_path}" --version')
-        # Example 1: 'Chromium 104.0.5112.79 Arch Linux\n'
-        # Example 2: 'Google Chrome 104.0.5112.79 Arch Linux\n'
-        complete_version = process.read()
-        process.close()
+        # Example 1: 'Chromium 104.0.5112.79 ...'
+        # Example 2: 'Google Chrome 104.0.5112.79 ...'
+        try:
+            cp = subprocess.run([chrome_path, '--version'], capture_output=True, text=True, timeout=3)
+            complete_version = (cp.stdout or cp.stderr or '').strip()
+        except Exception:
+            complete_version = ''
 
     CHROME_MAJOR_VERSION = complete_version.split('.')[0].split(' ')[-1]
     return CHROME_MAJOR_VERSION
@@ -317,20 +363,38 @@ def get_user_agent(driver=None) -> str:
     if USER_AGENT is not None:
         return USER_AGENT
 
+    # Fast path: if we can reuse a persisted UA from disk that matches the current Chrome major version,
+    # we avoid launching Chrome purely to compute navigator.userAgent.
+    chrome_major = None
+    try:
+        chrome_major = get_chrome_major_version()
+    except Exception:
+        chrome_major = None
+
+    cached = _load_user_agent_cache(chrome_major)
+    if cached:
+        USER_AGENT = cached
+        return USER_AGENT
+
+    created_here = False
     try:
         if driver is None:
+            created_here = True
             driver = get_webdriver()
         USER_AGENT = driver.execute_script("return navigator.userAgent")
         # Fix for Chrome 117 | https://github.com/FlareSolverr/FlareSolverr/issues/910
         USER_AGENT = re.sub('HEADLESS', '', USER_AGENT, flags=re.IGNORECASE)
+        _save_user_agent_cache(USER_AGENT, chrome_major)
         return USER_AGENT
     except Exception as e:
         raise Exception("Error getting browser User-Agent. " + str(e))
     finally:
-        if driver is not None:
-            if PLATFORM_VERSION == "nt":
-                driver.close()
-            driver.quit()
+        # Only shut down the driver if we started it here.
+        if created_here and driver is not None:
+            try:
+                driver.quit()
+            except Exception:
+                pass
 
 
 def start_xvfb_display():
